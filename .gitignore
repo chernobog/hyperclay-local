@@ -61,3 +61,6 @@ UPLOAD_REPORT.md
 # Agent guidelines
 GEMINI.md
 GEMINI.MD
+
+# Backups
+*.bak
