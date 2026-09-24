@@ -48,6 +48,14 @@ It implements the [Malleable HTML File Specification](https://malleablehtmlfile.
   - Spec §9: Multipart asset uploads (`POST /_/upload`).
 - **Data Protection & Version History**: Every save automatically archives a backup copy of the previous document into `_versions/<app>/<timestamp>-<etag>.html` before applying writes.
 - **Built-in Cloudgolem Hub**: When you open the root URL, if no `index.html` exists, an interactive launcher page is served to let you create and launch new malleable HTML applications instantly.
+- **Multi-Template Starter Library**: The built-in Hub allows you to launch diverse malleable apps with one click:
+  - 📝 **Writer & Notes**: Distraction-free rich text editor with live word count, typography controls, and notes formatting.
+  - 📋 **Kanban Board**: Drag-and-drop cards across customizable columns with tags and inline editing.
+  - 💻 **DevLog & Scratchpad**: Timestamped engineering logs, code snippets with copy actions, and quick search.
+  - ✅ **Project Checklist**: Task manager with real-time completion progress bar and filter tabs.
+  - 📄 **Blank Canvas**: Minimal malleable starter wired with self-saving protocol, ready for arbitrary HTML/CSS/JS.
+- **Direct File Import (Drag & Drop)**: Drop any existing `.html` or `.htmlclay` file (from Hyperclay, local projects, or templates) into the Hub to upload and host it instantly in R2.
+- **App Management**: Clone / duplicate existing applications and delete unused apps directly from the Hub.
 - **Zero Trust Ready**: Compatible with Cloudflare Access (Zero Trust) headers, with optional pre-shared key fallback (`AUTH_KEY`).
 
 ---
@@ -98,5 +106,5 @@ When set, mutating requests (`POST /_/save`, `POST /_/upload`) will require an `
 
 1. Navigate to `https://golem.akhensetukh.com/`
 2. If `index.html` is not yet set, the **Cloudgolem Hub** opens.
-3. Click **Create App** and enter a name (e.g. `writer.html` or `notes.html`).
-4. Click anywhere in the page to edit inline, and press **Ctrl+S** to save!
+3. Select any starter template (Writer, Kanban, DevLog, Checklist, Blank Canvas) or drop an existing `.html` file into the upload zone.
+4. Edit freely! Press `Ctrl+S` or `Cmd+S` anytime to save your changes back to Cloudflare R2.
