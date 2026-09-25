@@ -151,14 +151,31 @@ function getMimeType(path) {
   return MIME_TYPES[ext] || 'application/octet-stream';
 }
 
-// Dynamic CORS headers (avoiding unsafe wildcard on sensitive/mutating endpoints)
+// Helper to return standardized JSON responses conforming to Spec §3
+function jsonResponse(status, data, extraHeaders = {}, corsHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      ...corsHeaders,
+      ...BASE_SECURITY_HEADERS,
+      ...extraHeaders
+    }
+  });
+}
+
+function jsonError(status, msg, code, extra = {}, extraHeaders = {}, corsHeaders = {}) {
+  return jsonResponse(status, { msg, ...(code ? { code } : {}), ...extra }, extraHeaders, corsHeaders);
+}
+
+// Dynamic CORS headers conforming to Spec §3 & §8
 function getCorsHeaders(request, origin) {
   const reqOrigin = request.headers.get('Origin');
   if (reqOrigin && reqOrigin === origin) {
     return {
       'Access-Control-Allow-Origin': reqOrigin,
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Document-URL, Page-URL, If-Match, Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type, Document-URL, Page-URL, If-Match, Save-ID, Save-Trigger, Authorization',
       'Access-Control-Allow-Credentials': 'true',
       'Vary': 'Origin'
     };
@@ -191,10 +208,12 @@ function isAuthorized(request, env) {
   return false;
 }
 
-// Common client-side malleable self-saving script
+// Common client-side malleable self-saving script implementing normative Spec §2 Snapshot Algorithm
 function getMalleableClientScript() {
   return `
     let isDirty = false;
+    let currentEtag = document.documentElement.getAttribute('etag') || null;
+
     function markDirty() {
       isDirty = true;
       const st = document.getElementById('status');
@@ -209,7 +228,8 @@ function getMalleableClientScript() {
       el.addEventListener('input', markDirty);
     });
 
-    async function saveApp() {
+    // Normative Malleable HTML Snapshot & Save Algorithm (Spec §2 & §3)
+    async function saveApp(trigger = 'user') {
       const st = document.getElementById('status');
       if (st) {
         st.textContent = 'Saving...';
@@ -217,59 +237,165 @@ function getMalleableClientScript() {
         st.style.borderColor = '#58a6ff';
       }
 
-      // Sync checkboxes & inputs to DOM attributes
-      document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-        if (cb.checked) cb.setAttribute('checked', '');
-        else cb.removeAttribute('checked');
-      });
-      document.querySelectorAll('input[type="text"], textarea').forEach(inp => {
-        inp.setAttribute('value', inp.value);
+      // Step 1: Settle
+      // Step 2: Deep-clone documentElement (never mutate live DOM during capture)
+      const clone = document.documentElement.cloneNode(true);
+
+      // Step 3: Sync form state into markup on clone
+      clone.querySelectorAll('input, select, textarea').forEach(el => {
+        const tag = el.tagName.toLowerCase();
+        const type = (el.getAttribute('type') || 'text').toLowerCase();
+
+        if (type === 'password' || type === 'file') {
+          el.removeAttribute('value');
+          return;
+        }
+
+        if (tag === 'textarea') {
+          el.textContent = el.value;
+        } else if (tag === 'select') {
+          Array.from(el.options).forEach(opt => {
+            if (opt.selected) opt.setAttribute('selected', '');
+            else opt.removeAttribute('selected');
+          });
+        } else if (type === 'checkbox' || type === 'radio') {
+          if (el.checked) el.setAttribute('checked', '');
+          else el.removeAttribute('checked');
+        } else {
+          el.setAttribute('value', el.value);
+        }
       });
 
-      // Clone DOM and strip [no-save] elements
-      const clone = document.documentElement.cloneNode(true);
+      // Step 4: Pre-snapshot hooks
+      if (typeof window.onbeforesnapshot === 'function') {
+        try { window.onbeforesnapshot(clone); } catch (e) { console.warn('Pre-snapshot hook error:', e); }
+      }
+
+      // Step 5: Strip [no-snapshot] elements
+      clone.querySelectorAll('[no-snapshot]').forEach(el => el.remove());
+
+      // Step 6: Strip browser extension debris
+      clone.querySelectorAll('[data-lastpass-root], [data-grammarly-part], grammarly-extension, #loom-companion-mv3, [data-dashlane-rid], [data-dashlane-classification]').forEach(el => el.remove());
+
+      // Step 7: Save-time hooks & strip [no-save] elements
+      if (typeof window.onbeforesave === 'function') {
+        try { window.onbeforesave(clone); } catch (e) { console.warn('Pre-save hook error:', e); }
+      }
       clone.querySelectorAll('[no-save]').forEach(el => el.remove());
 
+      // Step 8: Serialize
       const payload = '<!DOCTYPE html>\\n' + clone.outerHTML;
+
+      // Step 9: Generate 128-bit random Save-ID (Spec §6 receipts)
+      const saveId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : (Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2));
+
+      const headers = {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Document-URL': window.location.href,
+        'Save-ID': saveId,
+        'Save-Trigger': trigger
+      };
+      if (currentEtag) {
+        headers['If-Match'] = currentEtag;
+      }
 
       try {
         const res = await fetch('/_/save', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'text/html; charset=utf-8',
-            'Document-URL': window.location.href
-          },
+          headers,
           body: payload
         });
 
+        const json = await res.json().catch(() => null);
+
         if (res.ok) {
           isDirty = false;
+          if (json && json.etag) {
+            currentEtag = json.etag;
+            document.documentElement.setAttribute('etag', json.etag);
+          }
           if (st) {
             st.textContent = 'Saved';
             st.style.color = '#3fb950';
             st.style.borderColor = '#30363d';
           }
-        } else {
-          const err = await res.json().catch(() => ({ msg: 'Save failed' }));
+        } else if (res.status === 412) {
+          // Conflict
           if (st) {
-            st.textContent = 'Error: ' + (err.msg || 'Save failed');
+            st.textContent = 'Conflict: modified elsewhere';
+            st.style.color = '#f85149';
+            st.style.borderColor = '#f85149';
+          }
+          if (confirm('This document was modified in another tab or session. Do you want to reload the latest version? (Cancel to overwrite)')) {
+            window.location.reload();
+          } else {
+            // Force overwrite by clearing currentEtag
+            currentEtag = null;
+            saveApp(trigger);
+          }
+        } else {
+          if (st) {
+            st.textContent = 'Error: ' + ((json && json.msg) || 'Save failed');
             st.style.color = '#f85149';
             st.style.borderColor = '#f85149';
           }
         }
       } catch (e) {
         if (st) {
-          st.textContent = 'Connection error';
+          st.textContent = 'Network error';
           st.style.color = '#f85149';
           st.style.borderColor = '#f85149';
         }
       }
     }
 
+    // Spec §9 Asset Drag-and-Drop Uploader directly in document
+    window.addEventListener('dragover', (e) => { e.preventDefault(); });
+    window.addEventListener('drop', async (e) => {
+      if (!e.dataTransfer || !e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
+      e.preventDefault();
+      const file = e.dataTransfer.files[0];
+      const st = document.getElementById('status');
+      if (st) {
+        st.textContent = 'Uploading asset...';
+        st.style.color = '#58a6ff';
+      }
+
+      const formData = new FormData();
+      formData.append('file', file);
+
+      try {
+        const res = await fetch('/_/upload', {
+          method: 'POST',
+          headers: { 'Document-URL': window.location.href },
+          body: formData
+        });
+        const json = await res.json().catch(() => null);
+        if (res.ok && json && json.uploads && json.uploads[0]) {
+          const upload = json.uploads[0];
+          const isImg = /\\.(png|jpe?g|gif|webp|svg)$/i.test(upload.name);
+          const elem = isImg
+            ? \`<img src="\${upload.url}" alt="\${upload.name}" style="max-width: 100%; border-radius: 6px; margin: 12px 0; display: block;">\`
+            : \`<p><a href="\${upload.url}" target="_blank">\${upload.name}</a> (\${Math.round(upload.bytes / 1024)} KB)</p>\`;
+          document.execCommand('insertHTML', false, elem);
+          markDirty();
+          saveApp('auto');
+        } else {
+          alert('Asset upload failed: ' + ((json && json.msg) || 'Error'));
+          if (st) { st.textContent = 'Upload failed'; st.style.color = '#f85149'; }
+        }
+      } catch (err) {
+        alert('Network error while uploading asset');
+        if (st) { st.textContent = 'Upload error'; st.style.color = '#f85149'; }
+      }
+    });
+
     window.addEventListener('keydown', (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
-        saveApp();
+        saveApp('user');
       }
     });
 
@@ -1822,8 +1948,16 @@ async function renderHubPage(env, origin) {
         Cloudflare R2 Bucket: <code>cloudgolem-storage</code>
       </div>
       <div class="info-item">
-        <b>Concurrency Control</b>
-        Conditional writes via ETags (SHA-256 slice 16)
+        <b>Concurrency & Receipts</b>
+        Conditional ETags & <code>Save-ID</code> receipts
+      </div>
+      <div class="info-item">
+        <b>Active Extensions</b>
+        <code>conditional</code>, <code>receipts</code>, <code>upload</code>
+      </div>
+      <div class="info-item">
+        <b>Conformance Suite</b>
+        <a href="/host-test.html" style="color: #3fb950; font-weight: 600; text-decoration: none;">Run Host Conformance Test &rarr;</a>
       </div>
     </div>
   </div>
@@ -1970,12 +2104,16 @@ export default {
       return renderHubPage(env, url.origin);
     }
 
+    if (pathname === '/_/test') {
+      return Response.redirect(new URL('/host-test.html', url.origin).toString(), 302);
+    }
+
     // -------------------------------------------------------------
     // Route 2: Hub Create App (`POST /_/apps/create`)
     // -------------------------------------------------------------
     if (request.method === 'POST' && pathname === '/_/apps/create') {
       if (!isAuthorized(request, env)) {
-        return new Response('Unauthorized', { status: 401, headers: BASE_SECURITY_HEADERS });
+        return jsonError(401, 'Unauthorized', 'unauthorized', {}, {}, corsHeaders);
       }
       let filename = 'app.html';
       let template = 'writer';
@@ -2162,24 +2300,40 @@ export default {
       const docHeader = request.headers.get('Document-URL') || request.headers.get('Page-URL');
       const meta = {
         spec: 1,
-        extensions: ['conditional', 'upload']
+        extensions: ['conditional', 'receipts', 'upload']
       };
 
       if (docHeader) {
         try {
-          const docPath = new URL(docHeader).pathname;
-          const target = resolveStoragePath(docPath);
-          if (target) {
-            const obj = await env.STORAGE.get(target);
-            if (obj) {
-              const body = await obj.text();
-              meta.document = { etag: await computeEtag(body) };
+          const docUrl = new URL(docHeader);
+          if (docUrl.origin === url.origin) {
+            const docPath = docUrl.pathname;
+            const target = resolveStoragePath(docPath);
+            if (target) {
+              const obj = await env.STORAGE.get(target);
+              if (obj) {
+                const body = await obj.text();
+                const currentEtag = await computeEtag(body);
+                const docBlock = {
+                  etag: currentEtag,
+                  writable: true,
+                  upload: {
+                    allowed: true,
+                    maxBytes: 52428800 // 50MB
+                  }
+                };
+                // Spec §6 receipts: report saveId if paired with current etag
+                if (obj.customMetadata?.saveId && obj.customMetadata?.etag === currentEtag) {
+                  docBlock.saveId = obj.customMetadata.saveId;
+                }
+                meta.document = docBlock;
+              }
             }
           }
         } catch {}
       }
 
-      return Response.json(meta, { headers: { ...corsHeaders, ...BASE_SECURITY_HEADERS } });
+      return jsonResponse(200, meta, {}, corsHeaders);
     }
 
     // -------------------------------------------------------------
@@ -2187,68 +2341,109 @@ export default {
     // -------------------------------------------------------------
     if (request.method === 'POST' && pathname === '/_/save') {
       if (!isAuthorized(request, env)) {
-        return Response.json({ msg: 'Unauthorized', code: 'forbidden' }, { status: 403, headers: { ...corsHeaders, ...BASE_SECURITY_HEADERS } });
+        return jsonError(403, 'Unauthorized', 'forbidden', {}, {}, corsHeaders);
+      }
+
+      const originHeader = request.headers.get('Origin');
+      const secFetchSite = request.headers.get('Sec-Fetch-Site');
+      if (originHeader && originHeader !== url.origin) {
+        return jsonError(403, 'Cross-origin save refused', 'forbidden', {}, {}, corsHeaders);
+      }
+      if (secFetchSite === 'cross-site') {
+        return jsonError(403, 'Cross-origin save refused', 'forbidden', {}, {}, corsHeaders);
       }
 
       const docHeader = request.headers.get('Document-URL') || request.headers.get('Page-URL');
       if (!docHeader) {
-        return Response.json({ msg: 'Missing Document-URL header', code: 'bad-request' }, { status: 400, headers: { ...corsHeaders, ...BASE_SECURITY_HEADERS } });
+        return jsonError(400, 'Missing Document-URL header', 'bad-request', {}, {}, corsHeaders);
       }
 
       let targetPath;
       try {
-        targetPath = resolveStoragePath(new URL(docHeader).pathname);
+        const docUrl = new URL(docHeader);
+        if (docUrl.origin !== url.origin) {
+          return jsonError(403, 'Document-URL origin mismatch', 'forbidden', {}, {}, corsHeaders);
+        }
+        targetPath = resolveStoragePath(docUrl.pathname);
       } catch {
-        return Response.json({ msg: 'Invalid Document-URL', code: 'bad-request' }, { status: 400, headers: { ...corsHeaders, ...BASE_SECURITY_HEADERS } });
+        return jsonError(400, 'Invalid Document-URL', 'bad-request', {}, {}, corsHeaders);
       }
 
       if (!targetPath) {
-        return Response.json({ msg: 'Path escapes root or accesses reserved namespace', code: 'forbidden' }, { status: 403, headers: { ...corsHeaders, ...BASE_SECURITY_HEADERS } });
+        return jsonError(403, 'Path escapes root or accesses reserved namespace', 'forbidden', {}, {}, corsHeaders);
       }
 
+      const saveId = request.headers.get('Save-ID') || null;
+      const saveTrigger = request.headers.get('Save-Trigger') || 'auto';
       const bodyText = await request.text();
 
       // Enforce doctype check
       if (!/^\s*<!doctype html>/i.test(bodyText) || !bodyText.includes('<html')) {
-        return Response.json({ msg: 'Not a complete HTML document', code: 'invalid-document' }, { status: 422, headers: { ...corsHeaders, ...BASE_SECURITY_HEADERS } });
+        return jsonError(422, 'Not a complete HTML document', 'invalid-document', {}, {}, corsHeaders);
       }
 
       // Spec §6: Check conditional If-Match if present
       const ifMatch = request.headers.get('If-Match');
       const existing = await env.STORAGE.get(targetPath);
       let existingContent = null;
+      let existingEtag = null;
+      let existingSaveId = null;
 
       if (existing) {
         existingContent = await existing.text();
-        const currentEtag = await computeEtag(existingContent);
+        existingEtag = await computeEtag(existingContent);
+        if (existing.customMetadata?.saveId && existing.customMetadata?.etag === existingEtag) {
+          existingSaveId = existing.customMetadata.saveId;
+        }
 
-        if (ifMatch && !isIfMatchSatisfied(ifMatch, currentEtag, existingContent.length)) {
-          return Response.json({ msg: 'Conflict: document changed', code: 'conflict' }, { status: 412, headers: { ...corsHeaders, ...BASE_SECURITY_HEADERS } });
+        if (ifMatch && !isIfMatchSatisfied(ifMatch, existingEtag, existingContent.length)) {
+          return jsonError(412, 'Conflict: document changed', 'conflict', {
+            etag: existingEtag,
+            ...(existingSaveId ? { saveId: existingSaveId } : {})
+          }, {}, corsHeaders);
         }
 
         // Backup existing version for undo / version history (internal storage write)
         const timestamp = Date.now();
-        const versionKey = `_versions/${targetPath}/${timestamp}-${currentEtag}.html`;
+        const versionKey = `_versions/${targetPath}/${timestamp}-${existingEtag}.html`;
         ctx.waitUntil(env.STORAGE.put(versionKey, existingContent, {
-          httpMetadata: { contentType: 'text/html; charset=utf-8' }
+          httpMetadata: { contentType: 'text/html; charset=utf-8' },
+          customMetadata: {
+            etag: existingEtag,
+            trigger: saveTrigger,
+            ...(existingSaveId ? { saveId: existingSaveId } : {})
+          }
         }));
       }
 
+      // Spec §4 & §9: Strip ephemeral host-injected attributes (savetoken, htmlclaytoken) before storing
+      const cleanBody = bodyText.replace(/(<html\b[^>]*?)>/i, (m, open) =>
+        open.replace(/\s+(?:savetoken|htmlclaytoken)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '') + '>'
+      );
+
       // Store updated document in R2
-      const newEtag = await computeEtag(bodyText);
-      await env.STORAGE.put(targetPath, bodyText, {
+      const newEtag = await computeEtag(cleanBody);
+      const metadata = {
+        etag: newEtag,
+        updated: new Date().toISOString(),
+        trigger: saveTrigger
+      };
+      if (saveId) {
+        metadata.saveId = saveId;
+      }
+
+      await env.STORAGE.put(targetPath, cleanBody, {
         httpMetadata: { contentType: 'text/html; charset=utf-8' },
-        customMetadata: { etag: newEtag, updated: new Date().toISOString() }
+        customMetadata: metadata
       });
 
-      return Response.json({ msg: 'Saved', etag: newEtag }, {
-        status: 200,
-        headers: {
-          ...corsHeaders,
-          ...BASE_SECURITY_HEADERS,
-          'ETag': `"${newEtag}"`
-        }
-      });
+      return jsonResponse(200, {
+        msg: 'Saved',
+        etag: newEtag,
+        ...(saveId ? { saveId } : {})
+      }, {
+        'ETag': `"${newEtag}"`
+      }, corsHeaders);
     }
 
     // -------------------------------------------------------------
@@ -2256,13 +2451,26 @@ export default {
     // -------------------------------------------------------------
     if (request.method === 'POST' && pathname === '/_/upload') {
       if (!isAuthorized(request, env)) {
-        return Response.json({ msg: 'Unauthorized', code: 'forbidden' }, { status: 403, headers: { ...corsHeaders, ...BASE_SECURITY_HEADERS } });
+        return jsonError(403, 'Unauthorized', 'forbidden', {}, {}, corsHeaders);
+      }
+
+      const originHeader = request.headers.get('Origin');
+      const secFetchSite = request.headers.get('Sec-Fetch-Site');
+      if (originHeader && originHeader !== url.origin) {
+        return jsonError(403, 'Cross-origin upload refused', 'forbidden', {}, {}, corsHeaders);
+      }
+      if (secFetchSite === 'cross-site') {
+        return jsonError(403, 'Cross-origin upload refused', 'forbidden', {}, {}, corsHeaders);
       }
 
       const docHeader = request.headers.get('Document-URL') || request.headers.get('Page-URL');
-      const docPath = docHeader ? new URL(docHeader).pathname : '/app.html';
-      const docClean = resolveStoragePath(docPath) || 'index.html';
-      const docStem = docClean.replace(/\.(html?|htmlclay)$/i, '');
+      let docStem = 'index';
+      if (docHeader) {
+        try {
+          const docClean = resolveStoragePath(new URL(docHeader).pathname) || 'index.html';
+          docStem = docClean.replace(/\.(html?|htmlclay)$/i, '');
+        } catch {}
+      }
       const assetDir = `assets-${docStem}`;
 
       const contentType = request.headers.get('content-type') || '';
@@ -2273,7 +2481,7 @@ export default {
         const formData = await request.formData();
         const file = formData.get('file');
         if (!file || typeof file === 'string') {
-          return Response.json({ msg: 'Missing file in form data', code: 'bad-request' }, { status: 400, headers: { ...corsHeaders, ...BASE_SECURITY_HEADERS } });
+          return jsonError(400, 'Missing file in form data', 'bad-request', {}, {}, corsHeaders);
         }
         filename = file.name || 'upload';
         fileBuffer = await file.arrayBuffer();
@@ -2282,16 +2490,32 @@ export default {
         filename = request.headers.get('X-File-Name') || 'upload.bin';
       }
 
-      // Sanitize asset filename (strip path and disallow executable extensions)
-      const rawName = filename.split('/').pop().split('\\').pop();
-      const safeName = rawName.replace(/[^a-zA-Z0-9._-]/g, '_');
-      const ext = safeName.includes('.') ? safeName.slice(safeName.lastIndexOf('.')).toLowerCase() : '';
-
-      if (DISALLOWED_ASSET_EXTS.has(ext)) {
-        return Response.json({ msg: `File extension '${ext}' not permitted for asset upload` }, { status: 400, headers: { ...corsHeaders, ...BASE_SECURITY_HEADERS } });
+      // Spec §9: Cap file size (50MB = 52428800 bytes)
+      const MAX_UPLOAD_BYTES = 52428800;
+      if (fileBuffer.byteLength > MAX_UPLOAD_BYTES) {
+        return jsonError(413, 'File exceeds maximum upload size (50MB)', 'too-large', {}, {}, corsHeaders);
       }
 
-      const base = safeName.replace(ext, '');
+      // Sanitize asset filename (strip path and disallow executable extensions)
+      const rawName = filename.split('/').pop().split('\\').pop();
+      const ext = rawName.includes('.') ? rawName.slice(rawName.lastIndexOf('.')).toLowerCase() : '';
+
+      // Spec §9: Refuse anything it would serve as a document with HTTP 415 unsupported-type
+      if (ext === '.html' || ext === '.htm' || ext === '.htmlclay') {
+        return jsonError(415, 'HTML documents must be saved via /_/save, not uploaded as assets', 'unsupported-type', {}, {}, corsHeaders);
+      }
+
+      // Content sniffing for HTML doctype in binary uploads
+      const prefixText = new TextDecoder().decode(fileBuffer.slice(0, 100));
+      if (/^\s*<!doctype\s+html/i.test(prefixText) || /^\s*<html[\s>]/i.test(prefixText)) {
+        return jsonError(415, 'HTML documents must be saved via /_/save, not uploaded as assets', 'unsupported-type', {}, {}, corsHeaders);
+      }
+
+      if (DISALLOWED_ASSET_EXTS.has(ext)) {
+        return jsonError(415, `File extension '${ext}' not permitted for asset upload`, 'unsupported-type', {}, {}, corsHeaders);
+      }
+
+      const base = rawName.replace(ext, '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'file';
       const hash = (await computeEtag(fileBuffer)).slice(0, 8);
       const storedFileName = `${base}-${hash}${ext}`;
       const assetKey = `${assetDir}/${storedFileName}`;
@@ -2301,11 +2525,16 @@ export default {
         httpMetadata: { contentType: mime }
       });
 
-      return Response.json({
-        name: storedFileName,
-        url: `/${assetKey}`,
-        bytes: fileBuffer.byteLength
-      }, { headers: { ...corsHeaders, ...BASE_SECURITY_HEADERS } });
+      return jsonResponse(200, {
+        msg: 'Uploaded 1 file',
+        uploads: [
+          {
+            name: storedFileName,
+            url: `${assetDir}/${storedFileName}`,
+            bytes: fileBuffer.byteLength
+          }
+        ]
+      }, {}, corsHeaders);
     }
 
     // -------------------------------------------------------------
@@ -2322,8 +2551,12 @@ export default {
       if (pathname === '/' || pathname === '') {
         const indexObj = await env.STORAGE.get('index.html');
         if (indexObj) {
-          const body = await indexObj.text();
+          let body = await indexObj.text();
           const etag = await computeEtag(body);
+          if (!/<html\b[^>]*\bdocumentid\s*=/i.test(body)) {
+            const docId = 'doc-' + crypto.randomUUID().slice(0, 12);
+            body = body.replace(/(<html\b[^>]*?)>/i, `$1 documentid="${docId}">`);
+          }
           return new Response(body, {
             headers: {
               'Content-Type': 'text/html; charset=utf-8',
@@ -2347,12 +2580,29 @@ export default {
       const isAsset = targetPath.startsWith('assets-');
       const mime = getMimeType(targetPath);
 
-      // Choose appropriate security headers
-      const securityHeaders = isAsset ? ASSET_SECURITY_HEADERS : (isHtml ? HTML_SECURITY_HEADERS : BASE_SECURITY_HEADERS);
+      if (isHtml) {
+        let body = await obj.text();
+        const etag = await computeEtag(body);
+        // Spec §4 & §9: Durable identity injection (documentid)
+        if (!/<html\b[^>]*\bdocumentid\s*=/i.test(body)) {
+          const docId = 'doc-' + crypto.randomUUID().slice(0, 12);
+          body = body.replace(/(<html\b[^>]*?)>/i, `$1 documentid="${docId}">`);
+        }
+        return new Response(body, {
+          headers: {
+            'Content-Type': 'text/html; charset=utf-8',
+            'ETag': `"${etag}"`,
+            'Cache-Control': 'no-cache',
+            ...corsHeaders,
+            ...HTML_SECURITY_HEADERS
+          }
+        });
+      }
 
+      const securityHeaders = isAsset ? ASSET_SECURITY_HEADERS : BASE_SECURITY_HEADERS;
       const headers = new Headers({
         'Content-Type': mime,
-        'Cache-Control': isHtml ? 'no-cache' : 'public, max-age=86400',
+        'Cache-Control': 'public, max-age=86400',
         ...corsHeaders,
         ...securityHeaders
       });
